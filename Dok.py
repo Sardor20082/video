@@ -4,22 +4,28 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
-)
-from telegram.constants import ChatMemberStatus
-import re
-from functools import lru_cache
+import aiofiles
 import tempfile
 import shutil
-from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request
-import threading
-import json
-import time
+from functools import lru_cache
+import re
 import urllib.parse
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.filters import CommandStart, Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+from aiohttp.web_app import Application
 
 # Logging sozlamalari
 logging.basicConfig(
@@ -28,12 +34,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot sozlamalari - Bu qiymatlarni o'zgartiring
-BOT_TOKEN = "7626749090:AAFL--dyGniYyUVQ-U0sErxtwOL0qbrytXs"
-WEBHOOK_URL = "https://video-fru1.onrender.com/webhook"
+# Bot sozlamalari
+BOT_TOKEN = "7626749090:AAFL--dyGniYyUVQ-U0sErxtwOL0qbrytX"
+WEBHOOK_URL = "https://video-br8o.onrender.com"
+WEBHOOK_PATH = "/webhook"
 PORT = int(os.environ.get("PORT", 8080))
 ADMIN_IDS = [6852738257]
 DATABASE_PATH = "bot_database.db"
+
+# Bot va dispatcher yaratish
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# Thread pool for downloading
+executor = ThreadPoolExecutor(max_workers=3)
 
 # Tillar
 LANGUAGES = {
@@ -127,7 +142,7 @@ Video linkini yuboring va kerakli sifatni tanlang!
 📱 You can download videos from the following platforms:
 • TikTok
 • YouTube (Videos and Shorts)
-• Facebook (Reels and Videos)  
+• Facebook (Reels and Videos)
 • Instagram (Reels, Stories, Posts)
 
 📝 Usage:
@@ -165,14 +180,9 @@ Send a video link and choose the desired quality!
     }
 }
 
-# Thread pool for downloading
-executor = ThreadPoolExecutor(max_workers=3)
-
-# Flask app
-app = Flask(__name__)
-
-# Global bot reference
-bot_application = None
+# State'lar
+class UserStates(StatesGroup):
+    waiting_broadcast = State()
 
 # Ma'lumotlar bazasini yaratish
 def init_database():
@@ -251,14 +261,15 @@ def _set_user_language_sync(user_id, language):
 
 # Til tanlash tugmalari
 def get_language_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("🇺🇿 O'zbek", callback_data="lang_uz"),
-            InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")
-        ],
-        [InlineKeyboardButton("🇺🇸 English", callback_data="lang_en")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🇺🇿 O'zbek", callback_data="lang_uz"),
+        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇺🇸 English", callback_data="lang_en")
+    )
+    return builder.as_markup()
 
 # Matnni olish
 async def get_text(user_id, key):
@@ -305,7 +316,7 @@ def _add_user_sync(user_id, username, first_name):
     conn.close()
 
 # Majburiy kanallarni tekshirish
-async def check_user_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+async def check_user_subscription(user_id: int) -> bool:
     channels = get_required_channels()
     
     if not channels:
@@ -314,7 +325,7 @@ async def check_user_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: i
     # Parallel ravishda barcha kanallarni tekshirish
     tasks = []
     for channel_id, _ in channels:
-        task = _check_single_channel(context, user_id, channel_id)
+        task = _check_single_channel(user_id, channel_id)
         tasks.append(task)
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -326,10 +337,10 @@ async def check_user_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: i
     
     return True
 
-async def _check_single_channel(context, user_id, channel_id):
+async def _check_single_channel(user_id, channel_id):
     try:
-        member = await context.bot.get_chat_member(channel_id, user_id)
-        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        member = await bot.get_chat_member(channel_id, user_id)
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
     except Exception:
         return True  # Xato bo'lsa, true qaytaramiz
 
@@ -340,62 +351,21 @@ async def get_subscription_keyboard(user_id):
     if not channels:
         return None
     
-    keyboard = []
+    builder = InlineKeyboardBuilder()
     for channel_id, channel_name in channels:
-        keyboard.append([InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/{channel_id.replace('@', '')}")])
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📢 {channel_name}", 
+                url=f"https://t.me/{channel_id.replace('@', '')}"
+            )
+        )
     
     check_text = await get_text(user_id, 'subscription_check')
-    keyboard.append([InlineKeyboardButton(check_text, callback_data="check_subscription")])
+    builder.row(
+        InlineKeyboardButton(text=check_text, callback_data="check_subscription")
+    )
     
-    return InlineKeyboardMarkup(keyboard)
-
-# Start komandasi
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await add_user(user.id, user.username, user.first_name)
-    
-    # Foydalanuvchi tilini tekshirish
-    user_language = await get_user_language(user.id)
-    
-    # Agar til tanlanmagan bo'lsa, til tanlash tugmalarini ko'rsatish
-    if not user_language or user_language == 'uz':
-        # Yangi foydalanuvchi uchun til tanlash
-        new_user_check = await _check_new_user(user.id)
-        if new_user_check:
-            choose_lang_text = LANGUAGES['uz']['choose_language']
-            keyboard = get_language_keyboard()
-            await update.message.reply_text(choose_lang_text, reply_markup=keyboard)
-            return
-    
-    # Obunani tekshirish
-    if not await check_user_subscription(context, user.id):
-        keyboard = await get_subscription_keyboard(user.id)
-        if keyboard:
-            subscription_text = await get_text(user.id, 'subscription_required')
-            await update.message.reply_text(subscription_text, reply_markup=keyboard)
-            return
-    
-    welcome_text = await get_text(user.id, 'welcome')
-    await update.message.reply_text(welcome_text)
-
-# Yangi foydalanuvchini tekshirish
-async def _check_new_user(user_id):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _check_new_user_sync, user_id)
-
-def _check_new_user_sync(user_id):
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT join_date FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        join_date = datetime.fromisoformat(result[0])
-        now = datetime.now()
-        # Agar 1 daqiqadan kam vaqt o'tgan bo'lsa, yangi foydalanuvchi
-        return (now - join_date).total_seconds() < 60
-    return True
+    return builder.as_markup()
 
 # Video linkini aniqlash
 @lru_cache(maxsize=50)
@@ -417,7 +387,7 @@ async def get_quality_keyboard(platform, url, user_id):
     # URL ni base64 qilib encode qilamiz uzunlik muammosini oldini olish uchun
     encoded_url = urllib.parse.quote(url, safe='')
     
-    keyboard = []
+    builder = InlineKeyboardBuilder()
     
     if platform == 'youtube':
         quality_720 = await get_text(user_id, 'quality_720')
@@ -425,24 +395,20 @@ async def get_quality_keyboard(platform, url, user_id):
         quality_360 = await get_text(user_id, 'quality_360')
         quality_audio = await get_text(user_id, 'quality_audio')
         
-        keyboard = [
-            [InlineKeyboardButton(quality_720, callback_data=f"dl_720_{encoded_url}")],
-            [InlineKeyboardButton(quality_480, callback_data=f"dl_480_{encoded_url}")],
-            [InlineKeyboardButton(quality_360, callback_data=f"dl_360_{encoded_url}")],
-            [InlineKeyboardButton(quality_audio, callback_data=f"dl_audio_{encoded_url}")]
-        ]
+        builder.row(InlineKeyboardButton(text=quality_720, callback_data=f"dl_720_{encoded_url}"))
+        builder.row(InlineKeyboardButton(text=quality_480, callback_data=f"dl_480_{encoded_url}"))
+        builder.row(InlineKeyboardButton(text=quality_360, callback_data=f"dl_360_{encoded_url}"))
+        builder.row(InlineKeyboardButton(text=quality_audio, callback_data=f"dl_audio_{encoded_url}"))
     else:
         quality_high = await get_text(user_id, 'quality_high')
         quality_medium = await get_text(user_id, 'quality_medium')
         quality_low = await get_text(user_id, 'quality_low')
         
-        keyboard = [
-            [InlineKeyboardButton(quality_high, callback_data=f"dl_high_{encoded_url}")],
-            [InlineKeyboardButton(quality_medium, callback_data=f"dl_medium_{encoded_url}")],
-            [InlineKeyboardButton(quality_low, callback_data=f"dl_low_{encoded_url}")]
-        ]
+        builder.row(InlineKeyboardButton(text=quality_high, callback_data=f"dl_high_{encoded_url}"))
+        builder.row(InlineKeyboardButton(text=quality_medium, callback_data=f"dl_medium_{encoded_url}"))
+        builder.row(InlineKeyboardButton(text=quality_low, callback_data=f"dl_low_{encoded_url}"))
     
-    return InlineKeyboardMarkup(keyboard)
+    return builder.as_markup()
 
 # Video yuklab olish
 async def download_video(url, quality='best'):
@@ -501,48 +467,6 @@ async def download_video(url, quality='best'):
     result = await loop.run_in_executor(executor, _download)
     return result
 
-# Xabar handler
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message_text = update.message.text
-    
-    # Obunani tekshirish
-    if not await check_user_subscription(context, user.id):
-        keyboard = await get_subscription_keyboard(user.id)
-        if keyboard:
-            subscription_text = await get_text(user.id, 'subscription_required')
-            await update.message.reply_text(subscription_text, reply_markup=keyboard)
-            return
-    
-    # URL tekshirish
-    if not (message_text.startswith('http://') or message_text.startswith('https://')):
-        send_link_text = await get_text(user.id, 'send_link')
-        await update.message.reply_text(send_link_text)
-        return
-    
-    platform = detect_platform(message_text)
-    
-    if not platform:
-        unknown_platform_text = await get_text(user.id, 'unknown_platform')
-        await update.message.reply_text(unknown_platform_text)
-        return
-    
-    # Sifat tanlash tugmalari
-    keyboard = await get_quality_keyboard(platform, message_text, user.id)
-    
-    platform_names = {
-        'tiktok': 'TikTok',
-        'youtube': 'YouTube',
-        'facebook': 'Facebook',
-        'instagram': 'Instagram'
-    }
-    
-    choose_quality_text = await get_text(user.id, 'choose_quality')
-    await update.message.reply_text(
-        f"📱 {platform_names[platform]} {choose_quality_text}",
-        reply_markup=keyboard
-    )
-
 # Statistikani yangilash
 async def update_download_stats():
     loop = asyncio.get_event_loop()
@@ -563,91 +487,62 @@ def _update_download_stats_sync():
     conn.commit()
     conn.close()
 
-# Callback query handler
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    # Til tanlash
-    if query.data.startswith("lang_"):
-        language = query.data.split("_")[1]
-        await set_user_language(query.from_user.id, language)
-        
-        language_changed_text = await get_text(query.from_user.id, 'language_changed')
-        await query.edit_message_text(language_changed_text)
-        
-        # Welcome xabarini yuborish
-        welcome_text = await get_text(query.from_user.id, 'welcome')
-        await context.bot.send_message(chat_id=query.message.chat_id, text=welcome_text)
-        return
-    
-    if query.data == "check_subscription":
-        if await check_user_subscription(context, query.from_user.id):
-            success_text = await get_text(query.from_user.id, 'subscription_success')
-            await query.edit_message_text(success_text)
-            
-            # Welcome xabarini yuborish
-            welcome_text = await get_text(query.from_user.id, 'welcome')
-            await context.bot.send_message(chat_id=query.message.chat_id, text=welcome_text)
-        else:
-            failed_text = await get_text(query.from_user.id, 'subscription_failed')
-            await query.answer(failed_text, show_alert=True)
-        return
-    
-    if query.data.startswith("dl_"):
-        parts = query.data.split("_", 2)
-        quality = parts[1]
-        encoded_url = parts[2]
-        url = urllib.parse.unquote(encoded_url)
-        
-        # Yuklanish jarayoni haqida xabar
-        downloading_text = await get_text(query.from_user.id, 'downloading')
-        progress_message = await query.edit_message_text(downloading_text)
-        
-        try:
-            # Video yuklab olish
-            result = await download_video(url, quality)
-            
-            if result['success']:
-                # Fayl yuborish
-                with open(result['filename'], 'rb') as video_file:
-                    caption = f"🎬 {result['title']}\n📤 @{context.bot.username}"
-                    
-                    # Fayl hajmini tekshirish
-                    file_size = os.path.getsize(result['filename'])
-                    if file_size > 50 * 1024 * 1024:  # 50MB
-                        large_file_text = await get_text(query.from_user.id, 'file_too_large')
-                        await progress_message.edit_text(large_file_text)
-                    else:
-                        await context.bot.send_video(
-                            chat_id=query.message.chat_id,
-                            video=video_file,
-                            caption=caption,
-                            supports_streaming=True
-                        )
-                        await progress_message.delete()
-                
-                # Vaqtinchalik fayllarni tozalash
-                shutil.rmtree(result['temp_dir'], ignore_errors=True)
-                
-                # Statistikani yangilash
-                await update_download_stats()
-                
-            else:
-                error_text = await get_text(query.from_user.id, 'download_error')
-                await progress_message.edit_text(f"{error_text} {result['error']}")
-                
-        except Exception as e:
-            send_error_text = await get_text(query.from_user.id, 'send_error')
-            await progress_message.edit_text(f"{send_error_text} {str(e)[:100]}")
+# Yangi foydalanuvchini tekshirish
+async def _check_new_user(user_id):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _check_new_user_sync, user_id)
 
-# == Admin panel ==
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+def _check_new_user_sync(user_id):
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT join_date FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        join_date = datetime.fromisoformat(result[0])
+        now = datetime.now()
+        # Agar 1 daqiqadan kam vaqt o'tgan bo'lsa, yangi foydalanuvchi
+        return (now - join_date).total_seconds() < 60
+    return True
+
+# Handlerlar
+@dp.message(CommandStart())
+async def start_handler(message: types.Message):
+    user = message.from_user
+    await add_user(user.id, user.username, user.first_name)
+    
+    # Foydalanuvchi tilini tekshirish
+    user_language = await get_user_language(user.id)
+    
+    # Agar til tanlanmagan bo'lsa, til tanlash tugmalarini ko'rsatish
+    if not user_language or user_language == 'uz':
+        # Yangi foydalanuvchi uchun til tanlash
+        new_user_check = await _check_new_user(user.id)
+        if new_user_check:
+            choose_lang_text = LANGUAGES['uz']['choose_language']
+            keyboard = get_language_keyboard()
+            await message.answer(choose_lang_text, reply_markup=keyboard)
+            return
+    
+    # Obunani tekshirish
+    if not await check_user_subscription(user.id):
+        keyboard = await get_subscription_keyboard(user.id)
+        if keyboard:
+            subscription_text = await get_text(user.id, 'subscription_required')
+            await message.answer(subscription_text, reply_markup=keyboard)
+            return
+    
+    welcome_text = await get_text(user.id, 'welcome')
+    await message.answer(welcome_text)
+
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    user_id = message.from_user.id
     
     if user_id not in ADMIN_IDS:
         admin_only_text = await get_text(user_id, 'admin_only')
-        await update.message.reply_text(admin_only_text)
+        await message.answer(admin_only_text)
         return
     
     stats_text = await get_text(user_id, 'stats')
@@ -655,19 +550,18 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels_text = await get_text(user_id, 'channels')
     users_text = await get_text(user_id, 'users')
     
-    keyboard = [
-        [InlineKeyboardButton(stats_text, callback_data="admin_stats")],
-        [InlineKeyboardButton(broadcast_text, callback_data="admin_broadcast")],
-        [InlineKeyboardButton(channels_text, callback_data="admin_channels")],
-        [InlineKeyboardButton(users_text, callback_data="admin_users")]
-    ]
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=stats_text, callback_data="admin_stats"))
+    builder.row(InlineKeyboardButton(text=broadcast_text, callback_data="admin_broadcast"))
+    builder.row(InlineKeyboardButton(text=channels_text, callback_data="admin_channels"))
+    builder.row(InlineKeyboardButton(text=users_text, callback_data="admin_users"))
     
     admin_panel_text = await get_text(user_id, 'admin_panel')
-    await update.message.reply_text(admin_panel_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await message.answer(admin_panel_text, reply_markup=builder.as_markup())
 
-# Statistika ko'rsatish
-async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+@dp.message(Command("stats"))
+async def show_stats(message: types.Message):
+    user_id = message.from_user.id
     
     if user_id not in ADMIN_IDS:
         return
@@ -686,7 +580,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👥 Yangi foydalanuvchilar: {stats['week_new']}
 ⬇️ Yuklab olishlar: {stats['week_downloads']}"""
 
-    await update.message.reply_text(stats_message)
+    await message.answer(stats_message)
 
 def _get_stats_sync():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -725,84 +619,293 @@ def _get_stats_sync():
         'week_downloads': week_downloads
     }
 
-# == Webhook orqali Flask server ==
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        if request.method == "POST":
-            json_data = request.get_json(force=True)
-            update = Update.de_json(json_data, bot_application.bot)
-            
-            # Async update ni process qilish
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(bot_application.process_update(update))
-            loop.close()
-            
-        return 'ok'
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'error'
-
-@app.route('/')
-def index():
-    return "Bot is running!"
-
-@app.route('/health')
-def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-# == Main funksiyasi ==
-async def main():
-    global bot_application
+@dp.message(F.text)
+async def handle_message(message: types.Message):
+    user = message.from_user
+    message_text = message.text
     
+    # Obunani tekshirish
+    if not await check_user_subscription(user.id):
+        keyboard = await get_subscription_keyboard(user.id)
+        if keyboard:
+            subscription_text = await get_text(user.id, 'subscription_required')
+            await message.answer(subscription_text, reply_markup=keyboard)
+            return
+    
+    # URL tekshirish
+    if not (message_text.startswith('http://') or message_text.startswith('https://')):
+        send_link_text = await get_text(user.id, 'send_link')
+        await message.answer(send_link_text)
+        return
+    
+    platform = detect_platform(message_text)
+    
+    if not platform:
+        unknown_platform_text = await get_text(user.id, 'unknown_platform')
+        await message.answer(unknown_platform_text)
+        return
+    
+    # Sifat tanlash tugmalari
+    keyboard = await get_quality_keyboard(platform, message_text, user.id)
+    
+    platform_names = {
+        'tiktok': 'TikTok',
+        'youtube': 'YouTube',
+        'facebook': 'Facebook',
+        'instagram': 'Instagram'
+    }
+    
+    choose_quality_text = await get_text(user.id, 'choose_quality')
+    await message.answer(
+        f"📱 {platform_names[platform]} {choose_quality_text}",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("lang_"))
+async def language_callback(callback: types.CallbackQuery):
+    language = callback.data.split("_")[1]
+    await set_user_language(callback.from_user.id, language)
+    
+    language_changed_text = await get_text(callback.from_user.id, 'language_changed')
+    await callback.message.edit_text(language_changed_text)
+    
+    # Welcome xabarini yuborish
+    welcome_text = await get_text(callback.from_user.id, 'welcome')
+    await callback.message.answer(welcome_text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription_callback(callback: types.CallbackQuery):
+    if await check_user_subscription(callback.from_user.id):
+        success_text = await get_text(callback.from_user.id, 'subscription_success')
+        await callback.message.edit_text(success_text)
+        
+        # Welcome xabarini yuborish
+        welcome_text = await get_text(callback.from_user.id, 'welcome')
+        await callback.message.answer(welcome_text)
+    else:
+        failed_text = await get_text(callback.from_user.id, 'subscription_failed')
+        await callback.answer(failed_text, show_alert=True)
+
+@dp.callback_query(F.data.startswith("dl_"))
+async def download_callback(callback: types.CallbackQuery):
+    parts = callback.data.split("_", 2)
+    quality = parts[1]
+    encoded_url = parts[2]
+    url = urllib.parse.unquote(encoded_url)
+    
+    # Yuklanish jarayoni haqida xabar
+    downloading_text = await get_text(callback.from_user.id, 'downloading')
+    await callback.message.edit_text(downloading_text)
+    
+    try:
+        # Video yuklab olish
+        result = await download_video(url, quality)
+        
+        if result['success']:
+            # Fayl yuborish
+            try:
+                # Fayl hajmini tekshirish
+                file_size = os.path.getsize(result['filename'])
+                if file_size > 50 * 1024 * 1024:  # 50MB
+                    large_file_text = await get_text(callback.from_user.id, 'file_too_large')
+                    await callback.message.edit_text(large_file_text)
+                else:
+                    video_file = FSInputFile(result['filename'])
+                    caption = f"🎬 {result['title']}\n📤 @{(await bot.get_me()).username}"
+                    
+                    await bot.send_video(
+                        chat_id=callback.message.chat.id,
+                        video=video_file,
+                        caption=caption,
+                        supports_streaming=True
+                    )
+                    await callback.message.delete()
+            except Exception as e:
+                send_error_text = await get_text(callback.from_user.id, 'send_error')
+                await callback.message.edit_text(f"{send_error_text} {str(e)[:100]}")
+            
+            # Vaqtinchalik fayllarni tozalash
+            shutil.rmtree(result['temp_dir'], ignore_errors=True)
+            
+            # Statistikani yangilash
+            await update_download_stats()
+            
+        else:
+            error_text = await get_text(callback.from_user.id, 'download_error')
+            await callback.message.edit_text(f"{error_text} {result['error']}")
+            
+    except Exception as e:
+        send_error_text = await get_text(callback.from_user.id, 'send_error')
+        await callback.message.edit_text(f"{send_error_text} {str(e)[:100]}")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def admin_callback(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    
+    action = callback.data.replace("admin_", "")
+    
+    if action == "stats":
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(None, _get_stats_sync)
+        
+        stats_message = f"""📊 Bot Statistikasi:
+
+👥 Jami foydalanuvchilar: {stats['total_users']}
+📅 Bugungi yangi foydalanuvchilar: {stats['today_new']}
+🔥 Bugungi faol foydalanuvchilar: {stats['today_active']}
+⬇️ Bugungi yuklab olishlar: {stats['today_downloads']}
+
+📈 Oxirgi 7 kun:
+👥 Yangi foydalanuvchilar: {stats['week_new']}
+⬇️ Yuklab olishlar: {stats['week_downloads']}"""
+
+        await callback.message.edit_text(stats_message)
+    
+    elif action == "broadcast":
+        await callback.message.edit_text("📢 Barcha foydalanuvchilarga yuborish uchun xabarni yozing:")
+        await state.set_state(UserStates.waiting_broadcast)
+    
+    elif action == "channels":
+        channels = get_required_channels()
+        if channels:
+            channel_list = "\n".join([f"• {name} (@{channel_id})" for channel_id, name in channels])
+            await callback.message.edit_text(f"📢 Majburiy kanallar:\n\n{channel_list}")
+        else:
+            await callback.message.edit_text("📢 Hozircha majburiy kanallar yo'q")
+    
+    elif action == "users":
+        loop = asyncio.get_event_loop()
+        user_count = await loop.run_in_executor(None, _get_user_count_sync)
+        await callback.message.edit_text(f"👥 Jami foydalanuvchilar: {user_count}")
+    
+    await callback.answer()
+
+def _get_user_count_sync():
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = TRUE')
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+@dp.message(UserStates.waiting_broadcast)
+async def broadcast_message(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    broadcast_text = message.text
+    
+    # Barcha foydalanuvchilarni olish
+    loop = asyncio.get_event_loop()
+    users = await loop.run_in_executor(None, _get_all_users_sync)
+    
+    sent_count = 0
+    failed_count = 0
+    
+    status_message = await message.answer(f"📢 Xabar yuborilmoqda...\n✅ Yuborildi: {sent_count}\n❌ Xato: {failed_count}")
+    
+    for user_id in users:
+        try:
+            await bot.send_message(user_id, broadcast_text)
+            sent_count += 1
+        except Exception:
+            failed_count += 1
+        
+        # Har 10 ta xabardan keyin statusni yangilash
+        if (sent_count + failed_count) % 10 == 0:
+            try:
+                await status_message.edit_text(
+                    f"📢 Xabar yuborilmoqda...\n✅ Yuborildi: {sent_count}\n❌ Xato: {failed_count}"
+                )
+            except:
+                pass
+    
+    # Yakuniy natija
+    await status_message.edit_text(
+        f"📢 Xabar yuborish tugadi!\n✅ Yuborildi: {sent_count}\n❌ Xato: {failed_count}"
+    )
+    
+    await state.clear()
+
+def _get_all_users_sync():
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users WHERE is_active = TRUE')
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+# Webhook setup
+async def on_startup(app: Application):
+    """Startup event handler"""
+    webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+    await bot.set_webhook(webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
+
+async def on_shutdown(app: Application):
+    """Shutdown event handler"""
+    await bot.delete_webhook()
+    logger.info("Webhook deleted")
+
+def create_app():
+    """Create aiohttp application"""
+    app = web.Application()
+    
+    # Webhook handler
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    
+    # Startup/shutdown events
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # Health check endpoint
+    async def health_check(request):
+        return web.json_response({"status": "healthy", "timestamp": datetime.now().isoformat()})
+    
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/', lambda r: web.json_response({"status": "Bot is running!"}))
+    
+    return app
+
+async def main():
+    """Main function"""
     # Ma'lumotlar bazasini ishga tushirish
     init_database()
     
-    # Bot application yaratish
-    bot_application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Handlerlar qo'shish
-    bot_application.add_handler(CommandHandler("start", start))
-    bot_application.add_handler(CommandHandler("admin", admin_panel))
-    bot_application.add_handler(CommandHandler("stats", show_stats))
-    bot_application.add_handler(CallbackQueryHandler(handle_callback))
-    bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Webhook o'rnatish
-    try:
-        await bot_application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-        logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
+    # App yaratish
+    app = create_app()
     
     # Bot application ni initialize qilish
-    await bot_application.initialize()
-    await bot_application.start()
-    
-    logger.info("Bot started successfully!")
-
-def run_flask():
-    """Flask serverni alohida threadda ishga tushirish"""
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    # Flask serverni background threadda ishga tushirish
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Bot ni ishga tushirish
     try:
-        asyncio.run(main())
-        
-        # Server ni ishlatish
-        while True:
-            time.sleep(1)
-            
+        # Webhook mode uchun
+        if WEBHOOK_URL:
+            app = create_app()
+            web.run_app(app, host="0.0.0.0", port=PORT)
+        else:
+            # Polling mode uchun
+            asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Critical error: {e}")
-        # Bot ni qayta ishga tushirishga harakat qilish
         time.sleep(5)
-        asyncio.run(main())
+        # Bot ni qayta ishga tushirishga harakat qilish
+        if WEBHOOK_URL:
+            app = create_app()
+            web.run_app(app, host="0.0.0.0", port=PORT)
+        else:
+            asyncio.run(main())
